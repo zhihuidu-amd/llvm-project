@@ -1983,6 +1983,9 @@ GCNTTIImpl::instCombineIntrinsic(InstCombiner &IC, IntrinsicInst &II) const {
       return &II;
     }
 
+    if (match(II.getArgOperand(1), m_Zero()))
+      return IC.replaceInstUsesWith(II, II.getArgOperand(2));
+
     if (!match(II.getArgOperand(3), m_Zero()) || !II.hasOneUse())
       break;
 
