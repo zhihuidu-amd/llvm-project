@@ -630,6 +630,17 @@ public:
 
   bool hasCvtScaleForwardingHazard() const { return HasGFX950Insts; }
 
+  // GFX950 silently miscomputes a VOP3P packed-f32 instruction whose low
+  // result half gathers src0's low dword with src1's high dword, i.e.
+  // op_sel[0] == 0 && op_sel[1] == 1. Under concurrent MFMA traffic on the
+  // same CU the src1 operand can read as zero. No fault is raised, the source
+  // registers are undisturbed and the high half is unaffected, so the only
+  // symptom is a wrong result. Wait states cut the rate by three orders of
+  // magnitude but do not close the window, and the affected wave need not have
+  // issued an MFMA itself, so the encoding has to be avoided rather than
+  // scheduled around. See GCNHazardRecognizer::fixPkF32OpSelBug.
+  bool hasPkF32OpSelBug() const { return HasGFX950Insts; }
+
   // All GFX9 targets experience a fetch delay when an instruction at the start
   // of a loop header is split by a 32-byte fetch window boundary, but GFX950
   // is uniquely sensitive to this: the delay triggers further performance

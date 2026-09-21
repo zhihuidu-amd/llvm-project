@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
 
 using namespace llvm;
@@ -34,6 +35,9 @@ STATISTIC(NumWMMANopsHoisted,
           "Number of WMMA hazard V_NOPs hoisted from loops");
 STATISTIC(NumWMMAHoistingBailed,
           "Number of WMMA hazards where V_NOP hoisting was not possible");
+STATISTIC(NumPkF32OpSelCommuted,
+          "Number of v_pk_*_f32 instructions commuted to avoid the "
+          "GFX950 op_sel:[0,1] hazard");
 
 namespace {
 
@@ -1772,6 +1776,7 @@ void GCNHazardRecognizer::fixHazards(MachineInstr *MI) {
   fixWMMAHazards(MI); // fall-through if co-execution is enabled.
   fixWMMACoexecutionHazards(MI);
   fixShift64HighRegBug(MI);
+  fixPkF32OpSelBug(MI);
   fixVALUMaskWriteHazard(MI);
   fixRequiredExportPriority(MI);
   if (ST.requiresWaitIdleBeforeGetReg())
@@ -2785,6 +2790,60 @@ bool GCNHazardRecognizer::fixWMMACoexecutionHazards(MachineInstr *MI) {
     return true;
 
   emitVNops(*MI->getParent(), MI->getIterator(), WaitStatesNeeded);
+  return true;
+}
+
+// GFX950 can silently produce a wrong low half for a VOP3P packed-f32
+// instruction that gathers src0's low dword with src1's high dword, i.e.
+// op_sel[0] == 0 && op_sel[1] == 1: the src1 operand may read as zero when MFMA
+// work is in flight on the same CU. The sources are undisturbed, the high half
+// is always correct and nothing faults, so the corruption is silent.
+//
+// v_pk_add_f32, v_pk_mul_f32 and v_pk_fma_f32 are commutative in src0/src1, and
+// each source's op_sel, op_sel_hi, neg_lo and neg_hi bits live in that source's
+// own modifier operand. commuteInstruction swaps the modifier operands along
+// with the sources, so the rewrite carries every modifier with the operand it
+// belongs to, leaves the arithmetic bit-for-bit identical, and costs neither an
+// instruction nor a register. It turns op_sel:[0,1] into op_sel:[1,0], which
+// measures clean.
+bool GCNHazardRecognizer::fixPkF32OpSelBug(MachineInstr *MI) {
+  if (!ST.hasPkF32OpSelBug())
+    return false;
+
+  switch (MI->getOpcode()) {
+  default:
+    return false;
+  case AMDGPU::V_PK_ADD_F32:
+  case AMDGPU::V_PK_MUL_F32:
+  case AMDGPU::V_PK_FMA_F32:
+    break;
+  }
+
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  const MachineOperand *Src0Mods =
+      TII->getNamedOperand(*MI, AMDGPU::OpName::src0_modifiers);
+  const MachineOperand *Src1Mods =
+      TII->getNamedOperand(*MI, AMDGPU::OpName::src1_modifiers);
+  if (!Src0Mods || !Src1Mods)
+    return false;
+
+  // The low half of the result selects each source with that source's OP_SEL_0
+  // bit. op_sel_hi does not matter here: the high half is never affected, and
+  // op_sel[0] == 1 is safe whatever op_sel[1] holds.
+  if ((Src0Mods->getImm() & SISrcMods::OP_SEL_0) ||
+      !(Src1Mods->getImm() & SISrcMods::OP_SEL_0))
+    return false;
+
+  if (!TII->commuteInstruction(*MI)) {
+    // src0 and src1 of a VOP3P packed-f32 instruction accept the same operand
+    // classes, so the swap is expected to always be legal. Stop rather than
+    // emit an instruction that can silently compute a wrong value.
+    report_fatal_error(
+        "cannot apply the GFX950 v_pk_*_f32 op_sel workaround to: " +
+        Twine(TII->getName(MI->getOpcode())));
+  }
+
+  ++NumPkF32OpSelCommuted;
   return true;
 }
 
